@@ -1,0 +1,10 @@
+/build*/
+/.vs/
+/out/
+/dist/
+*.dll
+*.exe
+*.ilk
+*.log
+*.pdb
+*.zip
