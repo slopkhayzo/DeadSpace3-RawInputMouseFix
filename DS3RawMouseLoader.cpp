@@ -10,7 +10,7 @@
 namespace fs = std::filesystem;
 
 #ifndef DS3_RAW_MOUSE_DEFAULT_DLL
-#define DS3_RAW_MOUSE_DEFAULT_DLL L"DS3RawMouse.dll"
+#define DS3_RAW_MOUSE_DEFAULT_DLL L"DS3RawMouse.asi"
 #endif
 
 fs::path ExecutableDirectory() {
@@ -47,7 +47,7 @@ int wmain(int argc, wchar_t** argv) {
     const fs::path dllPath = fs::absolute(
         argc > 1 ? fs::path(argv[1]) : ExecutableDirectory() / DS3_RAW_MOUSE_DEFAULT_DLL);
     if (!fs::is_regular_file(dllPath)) {
-        std::wcerr << L"DLL not found: " << dllPath << L"\n";
+        std::wcerr << L"ASI plugin not found: " << dllPath << L"\n";
         return 2;
     }
     const DWORD processId = FindProcessId(L"deadspace3.exe");
@@ -70,7 +70,8 @@ int wmain(int argc, wchar_t** argv) {
     void* remotePath = VirtualAllocEx(process, nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (remotePath == nullptr ||
         !WriteProcessMemory(process, remotePath, pathText.c_str(), bytes, nullptr)) {
-        std::cerr << "Could not write the DLL path into the game process: " << GetLastError() << "\n";
+        std::cerr << "Could not write the plugin path into the game process: " << GetLastError()
+                  << "\n";
         if (remotePath != nullptr) {
             VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
         }
@@ -104,10 +105,11 @@ int wmain(int argc, wchar_t** argv) {
     CloseHandle(process);
 
     if (module == 0) {
-        std::cerr << "LoadLibraryW failed inside the game process.\n";
+        std::cerr << "LoadLibraryW could not load the ASI plugin inside the game process.\n";
         return 8;
     }
-    std::wcout << L"Loaded " << dllPath << L" into deadspace3.exe (PID " << processId << L").\n";
+    std::wcout << L"Loaded ASI plugin " << dllPath << L" into deadspace3.exe (PID "
+               << processId << L").\n";
 #ifdef DS3_RAW_MOUSE_LOADER_BUILD
     std::wcout << L"The raw-mouse and camera-smoothing fixes are now active.\n";
 #endif

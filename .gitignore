@@ -2,6 +2,8 @@
 /.vs/
 /out/
 /dist/
+/research/
+*.asi
 *.dll
 *.exe
 *.ilk

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -35,6 +36,8 @@ constexpr std::uintptr_t kThirdPersonRateReturnRva = 0x0033F407;
 constexpr std::uintptr_t kAimRateReturnRva = 0x0034E6A5;
 constexpr DWORD kSupportedTimeDateStamp = 0x511E9327;
 constexpr DWORD kSupportedSizeOfImage = 0x012D6000;
+constexpr DWORD kInitializationTimeoutMs = 120000;
+constexpr DWORD kInitializationPollMs = 50;
 
 constexpr std::uint8_t kRateFilterPrologue[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14};
 constexpr std::uint8_t kOrientationDampPrologue[] = {0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08};
@@ -50,9 +53,11 @@ struct WindowHook {
 };
 
 HMODULE g_self = nullptr;
+HANDLE g_instanceMutex = nullptr;
 std::uintptr_t g_imageBase = 0;
 MouseRateFilter g_originalFilter = nullptr;
 ChaseOrientationDamp g_originalOrientationDamp = nullptr;
+volatile LONG g_initializationStarted = 0;
 
 std::atomic<LONG> g_rawX{0};
 std::atomic<LONG> g_rawY{0};
@@ -93,11 +98,31 @@ void BuildSiblingPath(const char* filename, char (&path)[MAX_PATH]) {
     strcat_s(path, filename);
 }
 
-void Log(const char* format, ...) {
+bool OpenLogFile(FILE*& file) {
     char path[MAX_PATH]{};
     BuildSiblingPath(DS3_RAW_MOUSE_LOG_FILENAME, path);
+    if (path[0] != '\0' && fopen_s(&file, path, "a") == 0 && file != nullptr) {
+        return true;
+    }
+
+    char directory[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableA("LOCALAPPDATA", directory,
+                                                 static_cast<DWORD>(sizeof(directory)));
+    if (length == 0 || length >= sizeof(directory)) return false;
+    if (directory[length - 1] != '\\') strcat_s(directory, "\\");
+    strcat_s(directory, "DS3RawMouseFix");
+    if (!CreateDirectoryA(directory, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    strcpy_s(path, directory);
+    strcat_s(path, "\\");
+    strcat_s(path, DS3_RAW_MOUSE_LOG_FILENAME);
+    return fopen_s(&file, path, "a") == 0 && file != nullptr;
+}
+
+void Log(const char* format, ...) {
     FILE* file = nullptr;
-    if (path[0] == '\0' || fopen_s(&file, path, "a") != 0 || file == nullptr) return;
+    if (!OpenLogFile(file)) return;
     SYSTEMTIME time{};
     GetLocalTime(&time);
     std::fprintf(file, "%02u:%02u:%02u.%03u ", time.wHour, time.wMinute,
@@ -124,8 +149,25 @@ bool ReadSensitivity(const char* path, const char* key, LONG& micros) {
     if (text[0] == '\0') return false;
     char* end = nullptr;
     const float value = std::strtof(text, &end);
-    if (end == text || *end != '\0' || value < 0.000000001f || value > 0.1f) return false;
+    if (end == text || *end != '\0' || !std::isfinite(value) ||
+        value < 0.000000001f || value > 0.1f) {
+        return false;
+    }
     micros = static_cast<LONG>(value * 1000000.0f + 0.5f);
+    return true;
+}
+
+bool ReadMultiplier(const char* path, const char* key, LONG& permille) {
+    char text[64]{};
+    GetPrivateProfileStringA("Mouse", key, "", text, static_cast<DWORD>(sizeof(text)), path);
+    if (text[0] == '\0') return false;
+    char* end = nullptr;
+    const float value = std::strtof(text, &end);
+    if (end == text || *end != '\0' || !std::isfinite(value) ||
+        value < 0.1f || value > 5.0f) {
+        return false;
+    }
+    permille = static_cast<LONG>(value * 1000.0f + 0.5f);
     return true;
 }
 
@@ -136,14 +178,17 @@ void LoadConfig() {
     LONG thirdY = g_thirdPersonYMicros.load(std::memory_order_relaxed);
     LONG aimX = g_aimXMicros.load(std::memory_order_relaxed);
     LONG aimY = g_aimYMicros.load(std::memory_order_relaxed);
+    LONG multiplier = g_sensitivityPermille.load(std::memory_order_relaxed);
     const bool gotThirdX = ReadSensitivity(path, "ThirdPersonSensitivityX", thirdX);
     const bool gotThirdY = ReadSensitivity(path, "ThirdPersonSensitivityY", thirdY);
     const bool gotAimX = ReadSensitivity(path, "AimSensitivityX", aimX);
     const bool gotAimY = ReadSensitivity(path, "AimSensitivityY", aimY);
+    const bool gotMultiplier = ReadMultiplier(path, "SensitivityMultiplier", multiplier);
     if (gotThirdX) g_thirdPersonXMicros.store(thirdX, std::memory_order_relaxed);
     if (gotThirdY) g_thirdPersonYMicros.store(thirdY, std::memory_order_relaxed);
     if (gotAimX) g_aimXMicros.store(aimX, std::memory_order_relaxed);
     if (gotAimY) g_aimYMicros.store(aimY, std::memory_order_relaxed);
+    if (gotMultiplier) g_sensitivityPermille.store(multiplier, std::memory_order_relaxed);
 #if DS3_RAW_MOUSE_PRODUCT_BUILD
     InterlockedExchange(&g_rateEnabled, ReadBoolean(path, "RawInput", true) ? 1 : 0);
     InterlockedExchange(&g_dampEnabled,
@@ -151,10 +196,11 @@ void LoadConfig() {
     InterlockedExchange(&g_hotkeysEnabled, ReadBoolean(path, "Hotkeys", true) ? 1 : 0);
     InterlockedExchange(&g_diagnosticsEnabled, ReadBoolean(path, "Diagnostics", true) ? 1 : 0);
 #endif
-    const bool complete = gotThirdX && gotThirdY && gotAimX && gotAimY;
-    Log("config %s: third X=%.6f Y=%.6f; aim X=%.6f Y=%.6f (%s)",
-        complete ? "loaded" : "defaults/partial", thirdX / 1000000.0,
-        thirdY / 1000000.0, aimX / 1000000.0, aimY / 1000000.0, path);
+    const bool complete = gotThirdX && gotThirdY && gotAimX && gotAimY && gotMultiplier;
+    Log("config %s: multiplier=%.2f; third X=%.6f Y=%.6f; aim X=%.6f Y=%.6f (%s)",
+        complete ? "loaded" : "defaults/partial", multiplier / 1000.0,
+        thirdX / 1000000.0, thirdY / 1000000.0, aimX / 1000000.0,
+        aimY / 1000000.0, path);
 }
 
 bool SupportedGameImage() {
@@ -172,6 +218,87 @@ bool SupportedGameImage() {
             nt->OptionalHeader.SizeOfImage);
         return false;
     }
+    return true;
+}
+
+bool ExecutableBytesMatch(const std::uint8_t* address, const std::uint8_t* expected,
+                          std::size_t length) {
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+
+    const DWORD protection = memory.Protect & 0xffu;
+    if (protection != PAGE_EXECUTE && protection != PAGE_EXECUTE_READ &&
+        protection != PAGE_EXECUTE_READWRITE && protection != PAGE_EXECUTE_WRITECOPY) {
+        return false;
+    }
+
+    const auto regionBegin = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+    const auto regionEnd = regionBegin + memory.RegionSize;
+    const auto bytesBegin = reinterpret_cast<std::uintptr_t>(address);
+    if (bytesBegin < regionBegin || bytesBegin > regionEnd || length > regionEnd - bytesBegin) {
+        return false;
+    }
+
+    std::uint8_t actual[sizeof(kOrientationDampPrologue)]{};
+    if (length > sizeof(actual)) return false;
+    SIZE_T bytesRead = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), address, actual, length, &bytesRead) ||
+        bytesRead != length) {
+        return false;
+    }
+    return std::memcmp(actual, expected, length) == 0;
+}
+
+bool HookTargetsReady() {
+    const auto* filter = reinterpret_cast<const std::uint8_t*>(
+        g_imageBase + kMouseRateFilterRva);
+    const auto* damp = reinterpret_cast<const std::uint8_t*>(
+        g_imageBase + kChaseOrientationDampRva);
+    return ExecutableBytesMatch(filter, kRateFilterPrologue, sizeof(kRateFilterPrologue)) &&
+           ExecutableBytesMatch(damp, kOrientationDampPrologue,
+                                sizeof(kOrientationDampPrologue));
+}
+
+bool WaitForHookTargets() {
+    const DWORD started = GetTickCount();
+    if (HookTargetsReady()) {
+        Log("protected game code already ready");
+        return true;
+    }
+
+    Log("waiting up to %lu ms for protected game code", kInitializationTimeoutMs);
+    for (;;) {
+        const DWORD elapsed = GetTickCount() - started;
+        if (elapsed >= kInitializationTimeoutMs) {
+            Log("initialization timed out after %lu ms: hook prologues were not ready",
+                elapsed);
+            return false;
+        }
+        Sleep(kInitializationPollMs);
+        if (HookTargetsReady()) {
+            Log("protected game code ready after %lu ms", GetTickCount() - started);
+            return true;
+        }
+    }
+}
+
+bool AcquireInstanceGuard() {
+    wchar_t name[64]{};
+    wsprintfW(name, L"Local\\DS3RawMouseFix-%lu", GetCurrentProcessId());
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, name);
+    if (mutex == nullptr) {
+        Log("initialization failed: could not create instance guard error=%lu", GetLastError());
+        return false;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(mutex);
+        Log("initialization refused: another DS3 Raw Mouse Fix module is already loaded");
+        return false;
+    }
+    g_instanceMutex = mutex;
     return true;
 }
 
@@ -540,11 +667,14 @@ void PollHotkeys() {
 }
 
 DWORD WINAPI Initialize(LPVOID) {
+    if (InterlockedCompareExchange(&g_initializationStarted, 1, 0) != 0) return 1;
     g_imageBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     InitializeCriticalSection(&g_frameLock);
     InitializeCriticalSection(&g_windowLock);
     Log("DS3 Raw Mouse Fix %s loading", DS3_RAW_MOUSE_VERSION);
+    if (!AcquireInstanceGuard()) return 1;
     if (!SupportedGameImage()) return 1;
+    if (!WaitForHookTargets()) return 1;
     if (!InstallHooks()) return 1;
     LoadConfig();
 #if DS3_RAW_MOUSE_PRODUCT_BUILD
