@@ -9,6 +9,7 @@
 > in a specific direction, but over the playthrough it happened rarely, and only lasted
 > about 1 second, and a larger issue with mouse movement accumulating while the player's camera
 > is frozen, I will fix it eventually
+> If you're interested and want more (human generated) info, I have a blog post [here](https://slop-blog.enkhayzomachines.net/posts/dead-space-3-raw-input-mouse-fix) :)
 
 A runtime patch for the 32-bit PC version of *Dead Space 3*. It replaces the game's averaged,
 accelerated, clamped mouse values with relative Raw Input counts and removes the additional
