@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(DS3RawMouseFix VERSION 1.1.0 LANGUAGES CXX)
+project(DS3RawMouseFix VERSION 1.1.1 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT MSVC)
     message(FATAL_ERROR "DS3RawMouseFix requires the Microsoft Visual C++ toolchain on Windows.")

@@ -21,15 +21,24 @@ game executable on disk.
 
 ## Compatibility
 
-Only this executable is currently supported:
+This is the executable the patch was developed and tested against:
 
 - Dead Space 3 `1.0.0.1`
 - PE timestamp `0x511E9327`
+- PE image size `0x012D6000`
 - SHA-256 `BAA971A30B4D5B1F7BA132F29EE4DD8B51FC02371284C629D8D26EB850B62FEC`
 
-The ASI plugin verifies the executable architecture, timestamp, image size, and both patched
-instruction sequences before installing its hooks. An unsupported build fails closed and is left
-unchanged; the reason is written to `DS3RawMouse.log`.
+The SHA-256 is an identification value, not a runtime allowlist. The ASI recognizes the timestamp
+and image size above as the known retail build, but a different executable can also initialize if
+its reconstructed runtime image preserves every dependency of the patch. Before changing memory,
+the plugin verifies the x86 PE and section layout, extended signatures and ABI-sensitive operands
+at both hook targets, the writable frame counter, the retail DirectInput resolver strings, all nine
+known callers of the mouse-rate filter, and all three chase-camera callers of the orientation
+helper.
+
+This fallback is intentionally conservative. A different outer DRM wrapper or metadata can pass;
+moved or changed gameplay code cannot. Any failed check leaves the process unchanged and records
+the precise reason in `DS3RawMouse.log`.
 
 ## Install and use
 
@@ -116,7 +125,8 @@ required. The ASI intentionally uses x86 inline assembly and cannot be built as 
 Over 70% of the campaign has been played with the patch enabled without major issues.
 Normal third-person play and aiming have been validated for slow movement, rapid sweeps, repeated
 360-degree turns, independent X/Y sensitivities, firing, weapon switching, melee, stomp, camera
-collision, focus changes, and character following.
+collision, focus changes, and character following. Zero-G traversal/combat and turret sequences
+have also been tested successfully.
 
 The full campaign and co-op have not been comprehensively validated. Zero-G, turret, vehicle, and
 other special mouse consumers receive the third-person sensitivity profile unless RMB is held.
@@ -127,8 +137,8 @@ include the level/sequence, reproduction steps, and `DS3RawMouse.log` in a bug r
 
 The retail executable reconstructs protected game code after launch, so an on-disk executable
 patch is not suitable. An external ASI loader loads `DS3RawMouse.asi` during startup. The plugin
-validates the executable and waits up to two minutes for both target instruction sequences to
-become ready, then:
+validates the PE layout, waits up to two minutes for the extended target signatures to become
+ready, verifies their callers and runtime data dependencies, then:
 
 1. observes the game's existing Raw Input window without taking mouse messages away from it;
 2. replaces the accepted gameplay mouse-rate output with frame-rate-independent raw counts; and

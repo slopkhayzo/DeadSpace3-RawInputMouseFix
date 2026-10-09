@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1 - 2026-10-01
+
+- Replaced the exact timestamp/image-size runtime allowlist with a fail-closed compatibility
+  validator. Executables with different metadata may initialize only when the expected x86
+  section layout, reconstructed hook signatures and ABI, DirectInput resolver anchors, frame
+  counter, and all verified hook call relationships are intact.
+- Kept the released `1.0.0.1` executable metadata and SHA-256 as the known tested build identity.
+
 ## 1.1.0 - 2026-09-29
 
 - Converted the runtime patch into `DS3RawMouse.asi` for external ASI loaders.

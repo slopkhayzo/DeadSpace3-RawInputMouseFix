@@ -28,19 +28,42 @@ namespace {
 #define DS3_RAW_MOUSE_LOG_FILENAME "DS3RawMouse.log"
 #endif
 
-// Supported executable: Dead Space 3 1.0.0.1, decrypted image addresses rebased to RVAs.
+// Verified runtime layout from Dead Space 3 1.0.0.1. Other executable wrappers are
+// accepted only when the reconstructed game image retains this complete layout.
 constexpr std::uintptr_t kMouseRateFilterRva = 0x0000D820;
 constexpr std::uintptr_t kChaseOrientationDampRva = 0x0033EF10;
 constexpr std::uintptr_t kFrameStampRva = 0x00EA9A54;
+constexpr std::uintptr_t kInputManagerRva = 0x00DD1914;
+constexpr std::uintptr_t kDirectInputFactoryNameRva = 0x00AA39FC;
+constexpr std::uintptr_t kDirectInputModuleNameRva = 0x00AA3A10;
 constexpr std::uintptr_t kThirdPersonRateReturnRva = 0x0033F407;
 constexpr std::uintptr_t kAimRateReturnRva = 0x0034E6A5;
 constexpr DWORD kSupportedTimeDateStamp = 0x511E9327;
 constexpr DWORD kSupportedSizeOfImage = 0x012D6000;
 constexpr DWORD kInitializationTimeoutMs = 120000;
 constexpr DWORD kInitializationPollMs = 50;
+constexpr std::size_t kMaximumSections = 32;
 
 constexpr std::uint8_t kRateFilterPrologue[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14};
 constexpr std::uint8_t kOrientationDampPrologue[] = {0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08};
+constexpr std::uint8_t kRateFilterSignaturePrefix[] = {
+    0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14, 0xD9, 0xEE, 0x53, 0x56, 0x8B, 0xF1,
+    0x8B, 0x0D};
+constexpr std::uint8_t kRateFilterSignatureSuffix[] = {
+    0x8A, 0x81, 0x74, 0x05, 0x00, 0x00, 0x33, 0xDB, 0x88, 0x45, 0xFC, 0x3C,
+    0x10, 0x73, 0x23};
+constexpr std::uint8_t kOrientationDampSignature[] = {
+    0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4, 0xF0, 0x83, 0xC4,
+    0x04, 0x55, 0x8B, 0x6B, 0x04, 0x89, 0x6C, 0x24, 0x04, 0x8B, 0xEC,
+    0xD9, 0x43, 0x0C, 0x81, 0xEC, 0x1C, 0x02, 0x00, 0x00, 0xD9};
+constexpr char kDirectInputFactoryName[] = "DirectInput8Create";
+constexpr char kDirectInputModuleName[] = "DINPUT8.dll";
+
+constexpr std::uintptr_t kRateFilterCallRvas[] = {
+    0x00149F29, 0x0014F801, 0x00190720, 0x0024788D, 0x002788A9,
+    0x00279327, 0x0027A4B5, 0x0033F402, 0x0034E6A0};
+constexpr std::uintptr_t kOrientationDampCallRvas[] = {
+    0x0034DA6D, 0x0034DB89, 0x0034DC60};
 
 using MouseRateFilter = unsigned(__thiscall*)(void* self, float frameTime,
                                                float* horizontal, float* vertical);
@@ -52,9 +75,17 @@ struct WindowHook {
     WNDPROC original = nullptr;
 };
 
+struct GameImageLayout {
+    DWORD timeDateStamp = 0;
+    DWORD sizeOfImage = 0;
+    WORD sectionCount = 0;
+    IMAGE_SECTION_HEADER sections[kMaximumSections]{};
+};
+
 HMODULE g_self = nullptr;
 HANDLE g_instanceMutex = nullptr;
 std::uintptr_t g_imageBase = 0;
+DWORD g_imageSize = 0;
 MouseRateFilter g_originalFilter = nullptr;
 ChaseOrientationDamp g_originalOrientationDamp = nullptr;
 volatile LONG g_initializationStarted = 0;
@@ -203,21 +234,146 @@ void LoadConfig() {
         aimY / 1000000.0, path);
 }
 
-bool SupportedGameImage() {
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(g_imageBase);
-    if (dos == nullptr || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
+bool ReadMemory(const void* address, void* destination, std::size_t length) {
+    SIZE_T bytesRead = 0;
+    return length != 0 &&
+           ReadProcessMemory(GetCurrentProcess(), address, destination, length, &bytesRead) != FALSE &&
+           bytesRead == length;
+}
+
+bool ImageRangeValid(std::uintptr_t rva, std::size_t length) {
+    return length != 0 && rva < g_imageSize && length <= g_imageSize - rva;
+}
+
+bool ReadImage(std::uintptr_t rva, void* destination, std::size_t length) {
+    return ImageRangeValid(rva, length) &&
+           ReadMemory(reinterpret_cast<const void*>(g_imageBase + rva), destination, length);
+}
+
+bool ImageBytesMatch(std::uintptr_t rva, const void* expected, std::size_t length) {
+    std::uint8_t actual[64]{};
+    if (length > sizeof(actual) || !ReadImage(rva, actual, length)) return false;
+    return std::memcmp(actual, expected, length) == 0;
+}
+
+bool SectionNameEquals(const IMAGE_SECTION_HEADER& section, const char* expected) {
+    char name[IMAGE_SIZEOF_SHORT_NAME + 1]{};
+    std::memcpy(name, section.Name, IMAGE_SIZEOF_SHORT_NAME);
+    return std::strcmp(name, expected) == 0;
+}
+
+const IMAGE_SECTION_HEADER* FindSection(const GameImageLayout& image, const char* name) {
+    for (WORD index = 0; index < image.sectionCount; ++index) {
+        if (SectionNameEquals(image.sections[index], name)) return &image.sections[index];
+    }
+    return nullptr;
+}
+
+bool SectionContains(const IMAGE_SECTION_HEADER& section, std::uintptr_t rva,
+                     std::size_t length) {
+    const std::uintptr_t sectionSize =
+        (std::max)(static_cast<std::uintptr_t>(section.Misc.VirtualSize),
+                   static_cast<std::uintptr_t>(section.SizeOfRawData));
+    const std::uintptr_t sectionBegin = section.VirtualAddress;
+    return length != 0 && rva >= sectionBegin && rva - sectionBegin < sectionSize &&
+           length <= sectionSize - (rva - sectionBegin);
+}
+
+bool SectionHasCharacteristics(const IMAGE_SECTION_HEADER& section, DWORD required,
+                               DWORD forbidden) {
+    return (section.Characteristics & required) == required &&
+           (section.Characteristics & forbidden) == 0;
+}
+
+bool InspectGameImage(GameImageLayout& image) {
+    IMAGE_DOS_HEADER dos{};
+    if (!ReadMemory(reinterpret_cast<const void*>(g_imageBase), &dos, sizeof(dos)) ||
+        dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0x40 || dos.e_lfanew > 0x1000) {
         Log("unsupported executable: invalid DOS header");
         return false;
     }
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(g_imageBase + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
-        nt->FileHeader.TimeDateStamp != kSupportedTimeDateStamp ||
-        nt->OptionalHeader.SizeOfImage != kSupportedSizeOfImage) {
-        Log("unsupported executable: machine=%04x timestamp=%08lx image_size=%08lx",
-            nt->FileHeader.Machine, nt->FileHeader.TimeDateStamp,
-            nt->OptionalHeader.SizeOfImage);
+
+    IMAGE_NT_HEADERS32 nt{};
+    if (!ReadMemory(reinterpret_cast<const void*>(g_imageBase + dos.e_lfanew), &nt,
+                    sizeof(nt)) ||
+        nt.Signature != IMAGE_NT_SIGNATURE ||
+        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_I386 ||
+        nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC ||
+        nt.FileHeader.SizeOfOptionalHeader != sizeof(IMAGE_OPTIONAL_HEADER32) ||
+        (nt.FileHeader.Characteristics & IMAGE_FILE_EXECUTABLE_IMAGE) == 0 ||
+        (nt.FileHeader.Characteristics & IMAGE_FILE_DLL) != 0 ||
+        nt.FileHeader.NumberOfSections == 0 ||
+        nt.FileHeader.NumberOfSections > kMaximumSections ||
+        nt.OptionalHeader.SectionAlignment != 0x1000 ||
+        nt.OptionalHeader.SizeOfImage <= kFrameStampRva + sizeof(std::uint32_t)) {
+        Log("unsupported executable: invalid x86 PE layout");
         return false;
     }
+
+    const std::uintptr_t sectionTableRva =
+        static_cast<std::uintptr_t>(dos.e_lfanew) + offsetof(IMAGE_NT_HEADERS32, OptionalHeader) +
+        nt.FileHeader.SizeOfOptionalHeader;
+    const std::size_t sectionTableSize =
+        static_cast<std::size_t>(nt.FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
+    if (sectionTableRva > nt.OptionalHeader.SizeOfHeaders ||
+        sectionTableSize > nt.OptionalHeader.SizeOfHeaders - sectionTableRva ||
+        !ReadMemory(reinterpret_cast<const void*>(g_imageBase + sectionTableRva), image.sections,
+                    sectionTableSize)) {
+        Log("unsupported executable: invalid PE section table");
+        return false;
+    }
+
+    image.timeDateStamp = nt.FileHeader.TimeDateStamp;
+    image.sizeOfImage = nt.OptionalHeader.SizeOfImage;
+    image.sectionCount = nt.FileHeader.NumberOfSections;
+    g_imageSize = image.sizeOfImage;
+
+    const auto* text = FindSection(image, ".text");
+    const auto* readOnlyData = FindSection(image, ".rdata");
+    const auto* writableData = FindSection(image, ".data");
+    if (text == nullptr || readOnlyData == nullptr || writableData == nullptr ||
+        !SectionHasCharacteristics(*text, IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE |
+                                              IMAGE_SCN_MEM_READ,
+                                   IMAGE_SCN_MEM_WRITE) ||
+        !SectionHasCharacteristics(*readOnlyData,
+                                   IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+                                   IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE) ||
+        !SectionHasCharacteristics(*writableData,
+                                   IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+                                       IMAGE_SCN_MEM_WRITE,
+                                   IMAGE_SCN_MEM_EXECUTE) ||
+        !SectionContains(*text, kMouseRateFilterRva, sizeof(kRateFilterSignaturePrefix)) ||
+        !SectionContains(*text, kChaseOrientationDampRva,
+                         sizeof(kOrientationDampSignature)) ||
+        !SectionContains(*readOnlyData, kDirectInputFactoryNameRva,
+                         sizeof(kDirectInputFactoryName)) ||
+        !SectionContains(*readOnlyData, kDirectInputModuleNameRva,
+                         sizeof(kDirectInputModuleName)) ||
+        !SectionContains(*writableData, kFrameStampRva, sizeof(std::uint32_t))) {
+        Log("unsupported executable: required code/data section layout is absent");
+        return false;
+    }
+
+    for (const std::uintptr_t callRva : kRateFilterCallRvas) {
+        if (!SectionContains(*text, callRva, 5)) {
+            Log("unsupported executable: rate-filter caller RVA %08lx is outside .text",
+                static_cast<unsigned long>(callRva));
+            return false;
+        }
+    }
+    for (const std::uintptr_t callRva : kOrientationDampCallRvas) {
+        if (!SectionContains(*text, callRva, 5)) {
+            Log("unsupported executable: orientation caller RVA %08lx is outside .text",
+                static_cast<unsigned long>(callRva));
+            return false;
+        }
+    }
+
+    const bool knownBuild = image.timeDateStamp == kSupportedTimeDateStamp &&
+                            image.sizeOfImage == kSupportedSizeOfImage;
+    Log("executable metadata: timestamp=%08lx image_size=%08lx (%s)",
+        image.timeDateStamp, image.sizeOfImage,
+        knownBuild ? "known retail build" : "compatibility candidate");
     return true;
 }
 
@@ -242,7 +398,7 @@ bool ExecutableBytesMatch(const std::uint8_t* address, const std::uint8_t* expec
         return false;
     }
 
-    std::uint8_t actual[sizeof(kOrientationDampPrologue)]{};
+    std::uint8_t actual[64]{};
     if (length > sizeof(actual)) return false;
     SIZE_T bytesRead = 0;
     if (!ReadProcessMemory(GetCurrentProcess(), address, actual, length, &bytesRead) ||
@@ -252,19 +408,28 @@ bool ExecutableBytesMatch(const std::uint8_t* address, const std::uint8_t* expec
     return std::memcmp(actual, expected, length) == 0;
 }
 
-bool HookTargetsReady() {
+bool RuntimeSignaturesReady() {
     const auto* filter = reinterpret_cast<const std::uint8_t*>(
         g_imageBase + kMouseRateFilterRva);
     const auto* damp = reinterpret_cast<const std::uint8_t*>(
         g_imageBase + kChaseOrientationDampRva);
-    return ExecutableBytesMatch(filter, kRateFilterPrologue, sizeof(kRateFilterPrologue)) &&
-           ExecutableBytesMatch(damp, kOrientationDampPrologue,
-                                sizeof(kOrientationDampPrologue));
+    std::uint32_t inputManagerAddress = 0;
+    return ExecutableBytesMatch(filter, kRateFilterSignaturePrefix,
+                                sizeof(kRateFilterSignaturePrefix)) &&
+           ReadImage(kMouseRateFilterRva + sizeof(kRateFilterSignaturePrefix),
+                     &inputManagerAddress, sizeof(inputManagerAddress)) &&
+           inputManagerAddress == static_cast<std::uint32_t>(g_imageBase + kInputManagerRva) &&
+           ExecutableBytesMatch(filter + sizeof(kRateFilterSignaturePrefix) +
+                                    sizeof(inputManagerAddress),
+                                kRateFilterSignatureSuffix,
+                                sizeof(kRateFilterSignatureSuffix)) &&
+           ExecutableBytesMatch(damp, kOrientationDampSignature,
+                                sizeof(kOrientationDampSignature));
 }
 
 bool WaitForHookTargets() {
     const DWORD started = GetTickCount();
-    if (HookTargetsReady()) {
+    if (RuntimeSignaturesReady()) {
         Log("protected game code already ready");
         return true;
     }
@@ -273,16 +438,82 @@ bool WaitForHookTargets() {
     for (;;) {
         const DWORD elapsed = GetTickCount() - started;
         if (elapsed >= kInitializationTimeoutMs) {
-            Log("initialization timed out after %lu ms: hook prologues were not ready",
+            Log("initialization timed out after %lu ms: runtime signatures were not ready",
                 elapsed);
             return false;
         }
         Sleep(kInitializationPollMs);
-        if (HookTargetsReady()) {
+        if (RuntimeSignaturesReady()) {
             Log("protected game code ready after %lu ms", GetTickCount() - started);
             return true;
         }
     }
+}
+
+bool RelativeCallTargets(std::uintptr_t callRva, std::uintptr_t targetRva) {
+    std::uint8_t instruction[5]{};
+    if (!ReadImage(callRva, instruction, sizeof(instruction)) || instruction[0] != 0xE8) {
+        return false;
+    }
+    std::int32_t displacement = 0;
+    std::memcpy(&displacement, instruction + 1, sizeof(displacement));
+    const std::int64_t destination = static_cast<std::int64_t>(callRva) +
+                                     sizeof(instruction) + displacement;
+    return destination == static_cast<std::int64_t>(targetRva);
+}
+
+bool WritableMemoryAt(std::uintptr_t rva, std::size_t length) {
+    if (!ImageRangeValid(rva, length)) return false;
+    MEMORY_BASIC_INFORMATION memory{};
+    const auto* address = reinterpret_cast<const void*>(g_imageBase + rva);
+    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT || (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+        return false;
+    }
+    const DWORD protection = memory.Protect & 0xffu;
+    const bool writable = protection == PAGE_READWRITE || protection == PAGE_WRITECOPY ||
+                          protection == PAGE_EXECUTE_READWRITE ||
+                          protection == PAGE_EXECUTE_WRITECOPY;
+    const auto regionBegin = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+    const auto regionEnd = regionBegin + memory.RegionSize;
+    const auto bytesBegin = reinterpret_cast<std::uintptr_t>(address);
+    return writable && bytesBegin >= regionBegin && bytesBegin <= regionEnd &&
+           length <= regionEnd - bytesBegin;
+}
+
+bool ValidateCorrectionPaths() {
+    if (!RuntimeSignaturesReady()) {
+        Log("unsupported executable: reconstructed hook signatures changed");
+        return false;
+    }
+    if (!ImageBytesMatch(kDirectInputFactoryNameRva, kDirectInputFactoryName,
+                         sizeof(kDirectInputFactoryName)) ||
+        !ImageBytesMatch(kDirectInputModuleNameRva, kDirectInputModuleName,
+                         sizeof(kDirectInputModuleName))) {
+        Log("unsupported executable: retail DirectInput resolver layout changed");
+        return false;
+    }
+    if (!WritableMemoryAt(kFrameStampRva, sizeof(std::uint32_t))) {
+        Log("unsupported executable: frame-stamp storage is unavailable");
+        return false;
+    }
+    for (const std::uintptr_t callRva : kRateFilterCallRvas) {
+        if (!RelativeCallTargets(callRva, kMouseRateFilterRva)) {
+            Log("unsupported executable: rate-filter call relationship failed at RVA %08lx",
+                static_cast<unsigned long>(callRva));
+            return false;
+        }
+    }
+    for (const std::uintptr_t callRva : kOrientationDampCallRvas) {
+        if (!RelativeCallTargets(callRva, kChaseOrientationDampRva)) {
+            Log("unsupported executable: orientation call relationship failed at RVA %08lx",
+                static_cast<unsigned long>(callRva));
+            return false;
+        }
+    }
+    Log("runtime compatibility verified: hook ABIs, DirectInput anchors, frame stamp, "
+        "9 rate callers, and 3 orientation callers");
+    return true;
 }
 
 bool AcquireInstanceGuard() {
@@ -673,8 +904,10 @@ DWORD WINAPI Initialize(LPVOID) {
     InitializeCriticalSection(&g_windowLock);
     Log("DS3 Raw Mouse Fix %s loading", DS3_RAW_MOUSE_VERSION);
     if (!AcquireInstanceGuard()) return 1;
-    if (!SupportedGameImage()) return 1;
+    GameImageLayout image{};
+    if (!InspectGameImage(image)) return 1;
     if (!WaitForHookTargets()) return 1;
+    if (!ValidateCorrectionPaths()) return 1;
     if (!InstallHooks()) return 1;
     LoadConfig();
 #if DS3_RAW_MOUSE_PRODUCT_BUILD
