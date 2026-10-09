@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.1.2 - 2026-10-10
+
+- Fixed mouse movement accumulating while the camera is frozen (for example during a ladder
+  dismount) and being applied when control returns. Raw counts collected while the game is not
+  reading mouse input for more than 250 ms, or on frames where it rejects input, are now discarded.
+- Added a `stale_drops` counter to the five-second diagnostics line.
+
 ## 1.1.1 - 2026-10-01
 
 - Replaced the exact timestamp/image-size runtime allowlist with a fail-closed compatibility

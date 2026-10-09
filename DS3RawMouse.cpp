@@ -42,6 +42,9 @@ constexpr DWORD kSupportedTimeDateStamp = 0x511E9327;
 constexpr DWORD kSupportedSizeOfImage = 0x012D6000;
 constexpr DWORD kInitializationTimeoutMs = 120000;
 constexpr DWORD kInitializationPollMs = 50;
+// Raw counts older than this were collected while no camera consumer was running
+// (scripted transitions, menus, cutscenes) and must not be replayed afterwards.
+constexpr DWORD kStaleRawDeltaMs = 250;
 constexpr std::size_t kMaximumSections = 32;
 
 constexpr std::uint8_t kRateFilterPrologue[] = {0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x14};
@@ -98,6 +101,7 @@ std::atomic<ULONG> g_rateReplacements{0};
 std::atomic<ULONG> g_thirdPersonCalls{0};
 std::atomic<ULONG> g_aimCalls{0};
 std::atomic<ULONG> g_otherCalls{0};
+std::atomic<ULONG> g_staleDrops{0};
 std::atomic<LONG> g_thirdPersonXMicros{1100};
 std::atomic<LONG> g_thirdPersonYMicros{1650};
 std::atomic<LONG> g_aimXMicros{1100};
@@ -114,6 +118,7 @@ CRITICAL_SECTION g_frameLock{};
 std::uint32_t g_cachedFrame = 0xffffffffu;
 LONG g_cachedX = 0;
 LONG g_cachedY = 0;
+DWORD g_lastDrainTick = 0;
 
 CRITICAL_SECTION g_windowLock{};
 WindowHook g_windows[8]{};
@@ -582,6 +587,15 @@ void GetFrameRawDelta(LONG& x, LONG& y) {
         g_cachedFrame = frame;
         g_cachedX = g_rawX.exchange(0, std::memory_order_acq_rel);
         g_cachedY = g_rawY.exchange(0, std::memory_order_acq_rel);
+        const DWORD now = GetTickCount();
+        if (now - g_lastDrainTick > kStaleRawDeltaMs) {
+            if (g_cachedX != 0 || g_cachedY != 0) {
+                g_staleDrops.fetch_add(1, std::memory_order_relaxed);
+            }
+            g_cachedX = 0;
+            g_cachedY = 0;
+        }
+        g_lastDrainTick = now;
     }
     x = g_cachedX;
     y = g_cachedY;
@@ -592,15 +606,18 @@ unsigned __fastcall HookMouseRateFilter(void* self, void*, float frameTime,
                                         float* horizontal, float* vertical) {
     const unsigned accepted = g_originalFilter(self, frameTime, horizontal, vertical);
     g_filterCalls.fetch_add(1, std::memory_order_relaxed);
-    if (!RateEnabled() || (accepted & 0xffu) == 0 ||
-        horizontal == nullptr || vertical == nullptr || frameTime <= 0.000001f ||
-        !GameHasForeground()) {
-        return accepted;
-    }
+    if (!RateEnabled()) return accepted;
 
+    // Drain on every call: counts from a frame the game rejects are discarded here
+    // instead of being carried into the next accepted frame.
     LONG x = 0;
     LONG y = 0;
     GetFrameRawDelta(x, y);
+    if ((accepted & 0xffu) == 0 || horizontal == nullptr || vertical == nullptr ||
+        frameTime <= 0.000001f || !GameHasForeground()) {
+        return accepted;
+    }
+
     const std::uintptr_t returnRva = reinterpret_cast<std::uintptr_t>(_ReturnAddress()) - g_imageBase;
     const bool aimProfile = AimHeld();
     if (aimProfile) {
@@ -928,6 +945,7 @@ DWORD WINAPI Initialize(LPVOID) {
     ULONG priorThirdPersonCalls = 0;
     ULONG priorAimCalls = 0;
     ULONG priorOtherCalls = 0;
+    ULONG priorStaleDrops = 0;
     DWORD lastCaptureCheck = 0;
     DWORD lastReport = GetTickCount();
     for (;;) {
@@ -945,13 +963,15 @@ DWORD WINAPI Initialize(LPVOID) {
             const ULONG thirdPersonCalls = g_thirdPersonCalls.load();
             const ULONG aimCalls = g_aimCalls.load();
             const ULONG otherCalls = g_otherCalls.load();
+            const ULONG staleDrops = g_staleDrops.load();
             const ULONG bypasses = static_cast<ULONG>(
                 InterlockedCompareExchange(&g_dampBypasses, 0, 0));
             Log("5s stats: raw=%lu filter=%lu replaced=%lu profiles(third/aim)=%lu/%lu "
-                "other_callers=%lu damp_bypass=%lu rate=%u damp=%u aim_held=%u",
+                "other_callers=%lu damp_bypass=%lu stale_drops=%lu rate=%u damp=%u aim_held=%u",
                 packets - priorPackets, calls - priorCalls, replacements - priorReplacements,
                 thirdPersonCalls - priorThirdPersonCalls, aimCalls - priorAimCalls,
                 otherCalls - priorOtherCalls, bypasses - priorBypasses,
+                staleDrops - priorStaleDrops,
                 RateEnabled() ? 1u : 0u, DampEnabled() ? 1u : 0u, AimHeld() ? 1u : 0u);
             priorPackets = packets;
             priorCalls = calls;
@@ -959,6 +979,7 @@ DWORD WINAPI Initialize(LPVOID) {
             priorThirdPersonCalls = thirdPersonCalls;
             priorAimCalls = aimCalls;
             priorOtherCalls = otherCalls;
+            priorStaleDrops = staleDrops;
             priorBypasses = bypasses;
             lastReport = now;
         }
