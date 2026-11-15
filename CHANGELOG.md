@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0 - 2026-11-15
+
+- Compatibility with DS3 Debug Menu 1.2:
+  - The menu hashes the reconstructed game code about 15 s after launch and locks all of its
+    features when the hash differs from retail, which this fix's two hooks caused ("RUNTIME TEXT
+    DID NOT SETTLE"). While the menu is loaded, the hooks are now installed after its check has
+    finished (about 20 s after launch, before gameplay), detected from the code dump it writes
+    for each attempt, with a 30 s fallback when no dump appears.
+  - The menu's F7 (cleanup), Shift+F7 (reload) and F8 (AI/static) keys also toggled this fix's
+    smoothing bypass and raw input off. While the menu is loaded, this fix's bindings on F1, F7
+    and F8 now yield to it (logged once per key).
+- Hooks are now installed with one atomic 8-byte write per target instead of suspending every
+  other thread, which could deadlock against another plugin suspending threads at the same time.
+- Added a `[Hotkeys]` INI section: every runtime key can be rebound (`F1`-`F24`, navigation keys,
+  `Numpad0`-`9`, with optional `Ctrl+`/`Shift+`/`Alt+`) or disabled with `None`. Defaults are
+  unchanged (F6-F10).
+- Hotkeys now require exactly their configured modifiers (plain F7 no longer fires on Shift+F7)
+  and act only while the game window has focus.
+
 ## 1.1.2 - 2026-10-10
 
 - Fixed mouse movement accumulating while the camera is frozen (for example during a ladder

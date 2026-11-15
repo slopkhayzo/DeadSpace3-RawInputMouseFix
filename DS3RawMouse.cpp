@@ -123,6 +123,49 @@ DWORD g_lastDrainTick = 0;
 CRITICAL_SECTION g_windowLock{};
 WindowHook g_windows[8]{};
 
+// Hotkeys are read and polled only by the plugin's own worker thread.
+constexpr UINT kModifierCtrl = 1;
+constexpr UINT kModifierShift = 2;
+constexpr UINT kModifierAlt = 4;
+
+struct Hotkey {
+    UINT virtualKey = 0;  // 0: unbound
+    UINT modifiers = 0;
+};
+
+enum HotkeyAction : std::size_t {
+    kHotkeyReload,
+    kHotkeyToggleSmoothing,
+    kHotkeyToggleRaw,
+    kHotkeySensitivityDown,
+    kHotkeySensitivityUp,
+    kHotkeyCount
+};
+
+struct HotkeyBinding {
+    const char* iniKey;
+    const char* description;
+    Hotkey defaultKey;
+    Hotkey key;
+    bool wasDown;
+    bool yieldLogged;
+};
+
+HotkeyBinding g_hotkeys[kHotkeyCount] = {
+    {"ReloadConfig", "reload INI", {VK_F6, 0}, {VK_F6, 0}, false, false},
+    {"ToggleCameraSmoothing", "toggle smoothing bypass", {VK_F7, 0}, {VK_F7, 0}, false, false},
+    {"ToggleRawInput", "toggle raw input", {VK_F8, 0}, {VK_F8, 0}, false, false},
+    {"SensitivityDown", "multiplier -0.05", {VK_F9, 0}, {VK_F9, 0}, false, false},
+    {"SensitivityUp", "multiplier +0.05", {VK_F10, 0}, {VK_F10, 0}, false, false},
+};
+
+// DS3 Debug Menu (Nexus Mods, "DS3 Debug Menu" 1.2) polls F1 (menu), F7/Shift+F7
+// (cleanup/reload) and F8 (AI/static) globally. While it is loaded, bindings on those
+// keys yield to it so one key press never drives both mods.
+constexpr UINT kDebugMenuKeys[] = {VK_F1, VK_F7, VK_F8};
+constexpr char kDebugMenuExport[] = "DS3DebugMenu_GetVersion";
+bool g_debugMenuLoaded = false;
+
 void BuildSiblingPath(const char* filename, char (&path)[MAX_PATH]) {
     if (GetModuleFileNameA(g_self, path, MAX_PATH) == 0) {
         path[0] = '\0';
@@ -207,9 +250,137 @@ bool ReadMultiplier(const char* path, const char* key, LONG& permille) {
     return true;
 }
 
+struct NamedKey {
+    const char* name;
+    UINT virtualKey;
+};
+
+constexpr NamedKey kNamedKeys[] = {
+    {"Insert", VK_INSERT}, {"Delete", VK_DELETE}, {"Home", VK_HOME}, {"End", VK_END},
+    {"PageUp", VK_PRIOR}, {"PageDown", VK_NEXT}, {"Pause", VK_PAUSE},
+    {"ScrollLock", VK_SCROLL},
+};
+
+void TrimInPlace(char*& begin, char*& end) {
+    while (begin < end && (*begin == ' ' || *begin == '\t')) ++begin;
+    while (end > begin && (end[-1] == ' ' || end[-1] == '\t')) --end;
+}
+
+bool TokenEquals(const char* begin, const char* end, const char* expected) {
+    const std::size_t length = static_cast<std::size_t>(end - begin);
+    return std::strlen(expected) == length && _strnicmp(begin, expected, length) == 0;
+}
+
+UINT ParseKeyToken(const char* begin, const char* end) {
+    if (end - begin >= 2 && (*begin == 'F' || *begin == 'f')) {
+        int number = 0;
+        for (const char* digit = begin + 1; digit < end; ++digit) {
+            if (*digit < '0' || *digit > '9' || number > 24) return 0;
+            number = number * 10 + (*digit - '0');
+        }
+        return number >= 1 && number <= 24 ? static_cast<UINT>(VK_F1 + number - 1) : 0;
+    }
+    if (end - begin == 7 && _strnicmp(begin, "Numpad", 6) == 0 && begin[6] >= '0' &&
+        begin[6] <= '9') {
+        return static_cast<UINT>(VK_NUMPAD0 + (begin[6] - '0'));
+    }
+    for (const auto& named : kNamedKeys) {
+        if (TokenEquals(begin, end, named.name)) return named.virtualKey;
+    }
+    return 0;
+}
+
+// "F7", "Ctrl+Shift+F7", "None" (or empty) for unbound. Returns false when invalid.
+bool ParseHotkey(const char* text, Hotkey& result) {
+    char buffer[64]{};
+    strncpy_s(buffer, text, _TRUNCATE);
+    char* begin = buffer;
+    char* end = buffer + std::strlen(buffer);
+    TrimInPlace(begin, end);
+    if (begin == end || TokenEquals(begin, end, "None")) {
+        result = {};
+        return true;
+    }
+
+    Hotkey parsed{};
+    for (;;) {
+        char* plus = static_cast<char*>(std::memchr(begin, '+', static_cast<std::size_t>(end - begin)));
+        char* tokenBegin = begin;
+        char* tokenEnd = plus != nullptr ? plus : end;
+        TrimInPlace(tokenBegin, tokenEnd);
+        if (plus == nullptr) {
+            parsed.virtualKey = ParseKeyToken(tokenBegin, tokenEnd);
+            if (parsed.virtualKey == 0) return false;
+            result = parsed;
+            return true;
+        }
+        if (TokenEquals(tokenBegin, tokenEnd, "Ctrl") || TokenEquals(tokenBegin, tokenEnd, "Control")) {
+            parsed.modifiers |= kModifierCtrl;
+        } else if (TokenEquals(tokenBegin, tokenEnd, "Shift")) {
+            parsed.modifiers |= kModifierShift;
+        } else if (TokenEquals(tokenBegin, tokenEnd, "Alt")) {
+            parsed.modifiers |= kModifierAlt;
+        } else {
+            return false;
+        }
+        begin = plus + 1;
+    }
+}
+
+void FormatHotkey(const Hotkey& key, char (&text)[48]) {
+    text[0] = '\0';
+    if (key.virtualKey == 0) {
+        strcpy_s(text, "None");
+        return;
+    }
+    if ((key.modifiers & kModifierCtrl) != 0) strcat_s(text, "Ctrl+");
+    if ((key.modifiers & kModifierShift) != 0) strcat_s(text, "Shift+");
+    if ((key.modifiers & kModifierAlt) != 0) strcat_s(text, "Alt+");
+    char name[16]{};
+    if (key.virtualKey >= VK_F1 && key.virtualKey <= VK_F24) {
+        sprintf_s(name, "F%u", key.virtualKey - VK_F1 + 1);
+    } else if (key.virtualKey >= VK_NUMPAD0 && key.virtualKey <= VK_NUMPAD9) {
+        sprintf_s(name, "Numpad%u", key.virtualKey - VK_NUMPAD0);
+    } else {
+        for (const auto& named : kNamedKeys) {
+            if (named.virtualKey == key.virtualKey) strcpy_s(name, named.name);
+        }
+    }
+    strcat_s(text, name);
+}
+
+void LoadHotkeys(const char* path) {
+    for (auto& binding : g_hotkeys) {
+        char text[64]{};
+        constexpr char kMissing[] = "\x01";
+        GetPrivateProfileStringA("Hotkeys", binding.iniKey, kMissing, text,
+                                 static_cast<DWORD>(sizeof(text)), path);
+        Hotkey key = binding.defaultKey;
+        if (std::strcmp(text, kMissing) != 0 && !ParseHotkey(text, key)) {
+            Log("hotkey %s=\"%s\" is not a valid key; keeping the default", binding.iniKey, text);
+            key = binding.defaultKey;
+        }
+        if (key.virtualKey != binding.key.virtualKey || key.modifiers != binding.key.modifiers) {
+            binding.wasDown = true;  // a key held while reloading must be released first
+            binding.yieldLogged = false;
+        }
+        binding.key = key;
+    }
+    char summary[320]{};
+    for (const auto& binding : g_hotkeys) {
+        char name[48]{};
+        FormatHotkey(binding.key, name);
+        char part[96]{};
+        sprintf_s(part, "%s%s=%s", summary[0] != '\0' ? ", " : "", binding.iniKey, name);
+        strcat_s(summary, part);
+    }
+    Log("hotkeys: %s", summary);
+}
+
 void LoadConfig() {
     char path[MAX_PATH]{};
     BuildSiblingPath("ds3_raw_mouse.ini", path);
+    LoadHotkeys(path);
     LONG thirdX = g_thirdPersonXMicros.load(std::memory_order_relaxed);
     LONG thirdY = g_thirdPersonYMicros.load(std::memory_order_relaxed);
     LONG aimX = g_aimXMicros.load(std::memory_order_relaxed);
@@ -790,27 +961,6 @@ void EnsureRawCapture() {
     }
 }
 
-bool SuspendOtherThreads(bool suspend) {
-    const DWORD ownProcess = GetCurrentProcessId();
-    const DWORD ownThread = GetCurrentThreadId();
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return false;
-    THREADENTRY32 entry{};
-    entry.dwSize = sizeof(entry);
-    if (Thread32First(snapshot, &entry)) {
-        do {
-            if (entry.th32OwnerProcessID != ownProcess || entry.th32ThreadID == ownThread) continue;
-            HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
-            if (thread == nullptr) continue;
-            if (suspend) SuspendThread(thread);
-            else ResumeThread(thread);
-            CloseHandle(thread);
-        } while (Thread32Next(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
-    return true;
-}
-
 template <typename Function>
 bool BuildTrampoline(std::uint8_t* target, const std::uint8_t* expected, std::size_t patchLength,
                      Function& original, const char* name) {
@@ -832,21 +982,47 @@ bool BuildTrampoline(std::uint8_t* target, const std::uint8_t* expected, std::si
     return true;
 }
 
-bool WriteJump(std::uint8_t* target, std::size_t patchLength, const void* replacement,
-               const char* name) {
+// Both hook targets start on an 8-byte boundary, so the whole jump (plus the untouched bytes
+// that complete the qword) is published with one LOCK CMPXCHG8B. No thread can execute a
+// partly written jump, and no thread is suspended: suspending every thread can deadlock when
+// another plugin (for example DS3 Debug Menu) is suspending threads to install its own hooks.
+bool WriteJumpAtomic(std::uint8_t* target, const std::uint8_t* expected, std::size_t patchLength,
+                     const void* replacement, const char* name) {
+    constexpr std::size_t kWord = sizeof(LONG64);
+    if (patchLength < 5 || patchLength > kWord ||
+        (reinterpret_cast<std::uintptr_t>(target) & (kWord - 1)) != 0) {
+        Log("hook failed: %s target is not 8-byte aligned", name);
+        return false;
+    }
     DWORD oldProtection = 0;
-    if (!VirtualProtect(target, patchLength, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+    if (!VirtualProtect(target, kWord, PAGE_EXECUTE_READWRITE, &oldProtection)) {
         Log("hook failed: %s VirtualProtect error=%lu", name, GetLastError());
         return false;
     }
-    target[0] = 0xE9;
-    *reinterpret_cast<std::int32_t*>(target + 1) = static_cast<std::int32_t>(
+
+    std::uint8_t current[kWord]{};
+    std::memcpy(current, target, kWord);
+    std::uint8_t patched[kWord]{};
+    std::memcpy(patched, current, kWord);
+    patched[0] = 0xE9;
+    const auto displacement = static_cast<std::int32_t>(
         reinterpret_cast<const std::uint8_t*>(replacement) - (target + 5));
-    for (std::size_t index = 5; index < patchLength; ++index) target[index] = 0x90;
-    FlushInstructionCache(GetCurrentProcess(), target, patchLength);
+    std::memcpy(patched + 1, &displacement, sizeof(displacement));
+    for (std::size_t index = 5; index < patchLength; ++index) patched[index] = 0x90;
+
+    LONG64 comparand = 0;
+    LONG64 exchange = 0;
+    std::memcpy(&comparand, current, kWord);
+    std::memcpy(&exchange, patched, kWord);
+    const bool prologueIntact = std::memcmp(current, expected, patchLength) == 0;
+    const bool written = prologueIntact &&
+        _InterlockedCompareExchange64(reinterpret_cast<volatile LONG64*>(target), exchange,
+                                      comparand) == comparand;
+    FlushInstructionCache(GetCurrentProcess(), target, kWord);
     DWORD ignored = 0;
-    VirtualProtect(target, patchLength, oldProtection, &ignored);
-    return true;
+    VirtualProtect(target, kWord, oldProtection, &ignored);
+    if (!written) Log("hook failed: %s entry changed while installing", name);
+    return written;
 }
 
 bool InstallHooks() {
@@ -859,63 +1035,200 @@ bool InstallHooks() {
         return false;
     }
 
-    SuspendOtherThreads(true);
-    const bool filterInstalled = WriteJump(filter, sizeof(kRateFilterPrologue),
-                                           reinterpret_cast<const void*>(&HookMouseRateFilter),
-                                           "mouse rate filter");
-    const bool dampInstalled = WriteJump(damp, sizeof(kOrientationDampPrologue),
-                                         reinterpret_cast<const void*>(&HookChaseOrientationDamp),
-                                         "chase orientation damp");
-    SuspendOtherThreads(false);
+    const bool filterInstalled = WriteJumpAtomic(
+        filter, kRateFilterPrologue, sizeof(kRateFilterPrologue),
+        reinterpret_cast<const void*>(&HookMouseRateFilter), "mouse rate filter");
+    const bool dampInstalled = filterInstalled && WriteJumpAtomic(
+        damp, kOrientationDampPrologue, sizeof(kOrientationDampPrologue),
+        reinterpret_cast<const void*>(&HookChaseOrientationDamp), "chase orientation damp");
     return filterInstalled && dampInstalled;
 }
 
-void PollHotkeys() {
-    static bool f6WasDown = false;
-    static bool f7WasDown = false;
-    static bool f8WasDown = false;
-    static bool f9WasDown = false;
-    static bool f10WasDown = false;
-    const bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-    const bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-    const bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-    const bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
-    const bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-    if (InterlockedCompareExchange(&g_hotkeysEnabled, 0, 0) == 0) return;
-    if (f6 && !f6WasDown) {
-        LoadConfig();
-        LogEffectiveSensitivity("F6 reload");
+bool FindDebugMenuModule(wchar_t (&modulePath)[MAX_PATH]) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool found = false;
+    if (Module32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.hModule != g_self &&
+                GetProcAddress(entry.hModule, kDebugMenuExport) != nullptr) {
+                wcscpy_s(modulePath, entry.szExePath);
+                found = true;
+                break;
+            }
+        } while (Module32NextW(snapshot, &entry));
     }
-    if (f7 && !f7WasDown) {
+    CloseHandle(snapshot);
+    return found;
+}
+
+// The menu may load before or after this plugin, so look for it until it is found.
+bool DetectDebugMenu(wchar_t (&modulePath)[MAX_PATH]) {
+    if (g_debugMenuLoaded) return true;
+    if (!FindDebugMenuModule(modulePath)) return false;
+    g_debugMenuLoaded = true;
+    Log("DS3 Debug Menu detected (%ls): hotkeys on F1/F7/F8 are left to the menu", modulePath);
+    return true;
+}
+
+void DetectDebugMenu() {
+    wchar_t modulePath[MAX_PATH]{};
+    DetectDebugMenu(modulePath);
+}
+
+// DS3 Debug Menu 1.2 hashes the reconstructed game code about 15 s after it loads (then every
+// 5 s, up to 10 attempts) and locks all of its game features ("RUNTIME TEXT DID NOT SETTLE")
+// unless the hash matches the retail build. This plugin's two entry jumps change that code, so
+// while the menu is loaded they are installed only once its probe has finished. The game is
+// still in its intro or main menu by then, so no gameplay camera runs without the fix.
+//
+// The menu's log cannot be read while it runs (it is opened without sharing), but the menu
+// writes its code dump DS3_Runtime_Text.bin beside itself before every attempt and stops after
+// a verdict: the probe has finished once a dump was written and no other followed within one
+// retry interval.
+constexpr DWORD kDebugMenuDetectGraceMs = 3000;
+constexpr DWORD kDebugMenuProbeQuietMs = 6500;
+constexpr DWORD kDebugMenuNoDumpTimeoutMs = 30000;
+constexpr DWORD kDebugMenuProbeTimeoutMs = 90000;
+constexpr wchar_t kDebugMenuTextDump[] = L"DS3_Runtime_Text.bin";
+
+ULONGLONG FileWriteTime(const wchar_t* path) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &data)) return 0;
+    ULARGE_INTEGER time{};
+    time.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    time.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    return time.QuadPart;
+}
+
+void WaitForDebugMenuTextProbe(DWORD initializationStarted) {
+    wchar_t modulePath[MAX_PATH]{};
+    while (!DetectDebugMenu(modulePath)) {
+        if (GetTickCount() - initializationStarted >= kDebugMenuDetectGraceMs) return;
+        Sleep(100);
+    }
+
+    wchar_t dumpPath[MAX_PATH]{};
+    wcscpy_s(dumpPath, modulePath);
+    wchar_t* slash = wcsrchr(dumpPath, L'\\');
+    if (slash != nullptr) slash[1] = L'\0';
+    wcscat_s(dumpPath, kDebugMenuTextDump);
+    Log("waiting for DS3 Debug Menu's runtime-text probe before installing hooks");
+
+    // Only dumps written from now on belong to this session's probe.
+    FILETIME nowTime{};
+    GetSystemTimeAsFileTime(&nowTime);
+    ULARGE_INTEGER now{};
+    now.LowPart = nowTime.dwLowDateTime;
+    now.HighPart = nowTime.dwHighDateTime;
+    ULONGLONG lastWrite = (std::max)(FileWriteTime(dumpPath), now.QuadPart);
+    const DWORD started = GetTickCount();
+    DWORD lastDumpTick = 0;
+    unsigned attempts = 0;
+    for (;;) {
+        const ULONGLONG write = FileWriteTime(dumpPath);
+        const DWORD tick = GetTickCount();
+        if (write > lastWrite) {
+            lastWrite = write;
+            lastDumpTick = tick;
+            ++attempts;
+        }
+        if (attempts != 0 && tick - lastDumpTick >= kDebugMenuProbeQuietMs) {
+            Log("DS3 Debug Menu probe finished after %u attempt(s), %lu ms; installing hooks",
+                attempts, tick - started);
+            return;
+        }
+        if (attempts == 0 && tick - started >= kDebugMenuNoDumpTimeoutMs) {
+            Log("no DS3 Debug Menu probe seen after %lu ms; installing hooks", tick - started);
+            return;
+        }
+        if (tick - started >= kDebugMenuProbeTimeoutMs) {
+            Log("DS3 Debug Menu probe still running after %lu ms; installing hooks",
+                tick - started);
+            return;
+        }
+        Sleep(250);
+    }
+}
+
+bool HotkeyYieldsToDebugMenu(const Hotkey& key) {
+    if (!g_debugMenuLoaded) return false;
+    for (const UINT reserved : kDebugMenuKeys) {
+        if (key.virtualKey == reserved) return true;
+    }
+    return false;
+}
+
+bool KeyDown(int virtualKey) {
+    return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+}
+
+void RunHotkeyAction(std::size_t action, const char* keyName) {
+    switch (action) {
+    case kHotkeyReload:
+        LoadConfig();
+        LogEffectiveSensitivity("reload");
+        break;
+    case kHotkeyToggleSmoothing: {
         const bool enabled = !DampEnabled();
         InterlockedExchange(&g_dampEnabled, enabled ? 1 : 0);
-        Log("F7: chase orientation bypass %s", enabled ? "enabled" : "disabled");
+        Log("%s: chase orientation bypass %s", keyName, enabled ? "enabled" : "disabled");
+        break;
     }
-    if (f8 && !f8WasDown) {
+    case kHotkeyToggleRaw: {
         const bool enabled = !RateEnabled();
         InterlockedExchange(&g_rateEnabled, enabled ? 1 : 0);
         ClearRawDelta();
-        Log("F8: raw rate replacement %s", enabled ? "enabled" : "disabled");
+        Log("%s: raw rate replacement %s", keyName, enabled ? "enabled" : "disabled");
+        break;
     }
-    if (f9 && !f9WasDown) {
-        const LONG multiplier = (std::max)(100L, g_sensitivityPermille.load() - 50L);
-        g_sensitivityPermille.store(multiplier);
-        LogEffectiveSensitivity("F9");
+    case kHotkeySensitivityDown:
+        g_sensitivityPermille.store((std::max)(100L, g_sensitivityPermille.load() - 50L));
+        LogEffectiveSensitivity(keyName);
+        break;
+    case kHotkeySensitivityUp:
+        g_sensitivityPermille.store((std::min)(5000L, g_sensitivityPermille.load() + 50L));
+        LogEffectiveSensitivity(keyName);
+        break;
+    default:
+        break;
     }
-    if (f10 && !f10WasDown) {
-        const LONG multiplier = (std::min)(5000L, g_sensitivityPermille.load() + 50L);
-        g_sensitivityPermille.store(multiplier);
-        LogEffectiveSensitivity("F10");
+}
+
+void PollHotkeys() {
+    const UINT modifiers = (KeyDown(VK_CONTROL) ? kModifierCtrl : 0u) |
+                           (KeyDown(VK_SHIFT) ? kModifierShift : 0u) |
+                           (KeyDown(VK_MENU) ? kModifierAlt : 0u);
+    const bool active = InterlockedCompareExchange(&g_hotkeysEnabled, 0, 0) != 0 &&
+                        GameHasForeground();
+    for (std::size_t action = 0; action < kHotkeyCount; ++action) {
+        HotkeyBinding& binding = g_hotkeys[action];
+        if (binding.key.virtualKey == 0) continue;
+        // Exact modifiers: plain F7 does not fire on Shift+F7 and vice versa.
+        const bool down = KeyDown(static_cast<int>(binding.key.virtualKey)) &&
+                          modifiers == binding.key.modifiers;
+        const bool pressed = down && !binding.wasDown;
+        binding.wasDown = down;
+        if (!pressed || !active) continue;
+        char keyName[48]{};
+        FormatHotkey(binding.key, keyName);
+        if (HotkeyYieldsToDebugMenu(binding.key)) {
+            if (!binding.yieldLogged) {
+                Log("%s (%s) ignored: the key belongs to DS3 Debug Menu; set %s in [Hotkeys] "
+                    "to another key", keyName, binding.description, binding.iniKey);
+                binding.yieldLogged = true;
+            }
+            continue;
+        }
+        RunHotkeyAction(action, keyName);
     }
-    f6WasDown = f6;
-    f7WasDown = f7;
-    f8WasDown = f8;
-    f9WasDown = f9;
-    f10WasDown = f10;
 }
 
 DWORD WINAPI Initialize(LPVOID) {
     if (InterlockedCompareExchange(&g_initializationStarted, 1, 0) != 0) return 1;
+    const DWORD initializationStarted = GetTickCount();
     g_imageBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     InitializeCriticalSection(&g_frameLock);
     InitializeCriticalSection(&g_windowLock);
@@ -925,16 +1238,16 @@ DWORD WINAPI Initialize(LPVOID) {
     if (!InspectGameImage(image)) return 1;
     if (!WaitForHookTargets()) return 1;
     if (!ValidateCorrectionPaths()) return 1;
+    WaitForDebugMenuTextProbe(initializationStarted);
     if (!InstallHooks()) return 1;
     LoadConfig();
 #if DS3_RAW_MOUSE_PRODUCT_BUILD
-    Log("initialized: raw=%u smoothing_bypass=%u hotkeys=%u diagnostics=%u; "
-        "F6 reload, F7/F8 toggle, F9/F10 multiplier",
+    Log("initialized: raw=%u smoothing_bypass=%u hotkeys=%u diagnostics=%u",
         RateEnabled() ? 1u : 0u, DampEnabled() ? 1u : 0u,
         InterlockedCompareExchange(&g_hotkeysEnabled, 0, 0) != 0 ? 1u : 0u,
         InterlockedCompareExchange(&g_diagnosticsEnabled, 0, 0) != 0 ? 1u : 0u);
 #else
-    Log("initialized disabled: F6 reload config; F7 orientation bypass; F8 raw rate; F9/F10 multiplier");
+    Log("initialized disabled: patches start off; use the hotkeys listed above");
 #endif
     LogEffectiveSensitivity("initial sensitivity");
 
@@ -947,10 +1260,15 @@ DWORD WINAPI Initialize(LPVOID) {
     ULONG priorOtherCalls = 0;
     ULONG priorStaleDrops = 0;
     DWORD lastCaptureCheck = 0;
+    DWORD lastModuleCheck = 0;
     DWORD lastReport = GetTickCount();
     for (;;) {
-        PollHotkeys();
         const DWORD now = GetTickCount();
+        if (now - lastModuleCheck >= 1000) {
+            DetectDebugMenu();
+            lastModuleCheck = now;
+        }
+        PollHotkeys();
         if (now - lastCaptureCheck >= 100) {
             EnsureRawCapture();
             lastCaptureCheck = now;

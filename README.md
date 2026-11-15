@@ -78,16 +78,45 @@ Sensitivity values are radians per raw mouse count; higher values turn faster.
 - `Hotkeys`: enables the runtime controls below.
 - `Diagnostics`: writes five-second activity counters to `DS3RawMouse.log`.
 
-Runtime controls:
+Runtime controls (default keys; they act only while the game window has focus):
 
-- F6: reload the INI, including patch switches and sensitivities.
-- F7: toggle the third-person smoothing bypass.
-- F8: toggle raw mouse replacement.
-- F9/F10: lower/raise `SensitivityMultiplier` by `0.05`, preserving the four sensitivity ratios.
-  The hotkey adjustment is temporary; F6 or a game restart restores the value saved in the INI.
+- F6 (`ReloadConfig`): reload the INI, including patch switches, sensitivities, and hotkeys.
+- F7 (`ToggleCameraSmoothing`): toggle the third-person smoothing bypass.
+- F8 (`ToggleRawInput`): toggle raw mouse replacement.
+- F9/F10 (`SensitivityDown`/`SensitivityUp`): lower/raise `SensitivityMultiplier` by `0.05`,
+  preserving the four sensitivity ratios. The hotkey adjustment is temporary; F6 or a game
+  restart restores the value saved in the INI.
+
+Each key can be changed in the `[Hotkeys]` section of `ds3_raw_mouse.ini`: `F1`-`F24`, `Insert`,
+`Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Pause`, `ScrollLock`, or `Numpad0`-`Numpad9`,
+optionally prefixed by `Ctrl+`, `Shift+`, and/or `Alt+` (for example `Ctrl+F7`), or `None` to
+disable it. A key fires only with exactly the modifiers given.
 
 For example, twelve F9 presses from the default `1.0` produce a multiplier of `0.40`; set
 `SensitivityMultiplier=0.40` to make that the startup value.
+
+### DS3 Debug Menu
+
+The fix works alongside DS3 Debug Menu 1.2 (Nexus Mods). Install both as their
+packages describe; the menu's `winmm.dll` loader and this package's `dinput8.dll` loader can be
+present together (each plugin is loaded once), or you can use either loader alone with both ASI
+files in its `plugins` folder.
+
+About 15 seconds after the game starts, the menu checks that the game code is unmodified and
+otherwise locks its features ("RUNTIME TEXT DID NOT SETTLE | BINDINGS LOCKED"). Earlier versions
+of this fix had already installed their two hooks by then. When the menu is loaded, the fix now
+waits until that check has finished (about 20 seconds after launch, while the game is still at
+its intro or title screen) and logs `DS3 Debug Menu probe finished ... installing hooks`.
+
+The menu uses F1, F7 (cleanup), Shift+F7 (checkpoint reload), and F8 (AI/static). While the menu
+is loaded, this fix ignores its own bindings on F1, F7, and F8, so the menu's keys no longer switch
+the camera patches off. To keep the two toggles, bind them to free keys, for example:
+
+```ini
+[Hotkeys]
+ToggleCameraSmoothing=F11
+ToggleRawInput=F12
+```
 
 The aim profile follows physical right-mouse-button state, not the game's remappable aim action.
 Rebinding aim to another button therefore does not switch sensitivity profiles automatically.
